@@ -1,7 +1,5 @@
 # agy-quota
 
-> 🌏 中文說明在前，English documentation below ↓ ([jump to English](#english))
-
 **[Antigravity](https://antigravity.google)（`agy` CLI）/ Google Gemini Code Assist 的 headless 額度查詢工具。**
 
 直接從 Google 的 Code Assist 後端讀取你登入帳號的**真實**逐模型額度 —— 用的是 `agy` 本體自己呼叫的同一個端點 —— **不需要打開 Antigravity IDE、不需要 Windsurf/language-server 程序、也不需要任何本機 loopback API。** 輸出乾淨 JSON 給 agent/腳本用，或彩色表格給人看。
