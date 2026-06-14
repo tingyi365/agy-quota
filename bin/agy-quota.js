@@ -14,12 +14,13 @@
 const { getQuota } = require('../src/quota');
 
 function parseArgs(argv) {
-  const o = { json: false, plain: false, gate: null, help: false };
+  const o = { json: false, plain: false, gate: null, gateScope: 'google', help: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--json' || a === '-j') o.json = true;
     else if (a === '--plain' || a === '--no-color') o.plain = true;
     else if (a === '--gate') o.gate = parseFloat(argv[++i]);
+    else if (a === '--gate-scope') o.gateScope = String(argv[++i] || '').toLowerCase();
     else if (a === '--help' || a === '-h') o.help = true;
   }
   return o;
@@ -31,13 +32,19 @@ Usage:
   agy-quota [options]
 
 Options:
-  -j, --json        Emit clean JSON (for agents/scripts)
-      --plain       Disable ANSI colors
-      --gate <pct>  Exit 0 if worst remaining >= <pct>%, else exit 10
-  -h, --help        Show this help
+  -j, --json            Emit clean JSON (for agents/scripts)
+      --plain           Disable ANSI colors
+      --gate <pct>      Exit 0 if worst remaining >= <pct>%, else exit 10
+      --gate-scope <s>  Gate on 'google' (default, gemini REQUESTS buckets) or
+                        'all' (worst across every provider pool)
+  -h, --help            Show this help
 
-JSON fields: account, plan, current_tier, remaining_fraction (0-1, worst model),
-             reset_time (ISO), models[], source, fetched_at
+JSON fields: account, plan, current_tier, remaining_fraction (0-1, gemini
+             buckets — worst), reset_time (ISO), models[] (gemini buckets),
+             providers[] (ALL models grouped ANTHROPIC/OPENAI/GOOGLE, each with
+             model_id/remaining_percent/token_type/reset_time + pooled scope),
+             remaining_fraction_all_pools, remaining_percent_all_pools,
+             source, fetched_at
 Exit codes:  0 ok  ·  1 error  ·  10 gate not met`;
 
 const C = {
@@ -79,6 +86,17 @@ function pad(s, n) {
   return s + ' '.repeat(Math.max(0, n - visible.length));
 }
 
+function modelRow(m, nameW, plain, rs) {
+  const frac = m.remaining_fraction == null ? 1 : m.remaining_fraction;
+  const col = colorFor(frac, plain);
+  const pct = m.remaining_percent == null ? '—' : `${m.remaining_percent.toFixed(1)}%`;
+  const pctStr = plain ? pct : `${col}${pct}${rs}`;
+  return (
+    `  ${pad(m.model_id, nameW)}  ${bar(frac, 20, plain)} ` +
+    `${pad(pctStr, plain ? 7 : 16)}  ${fmtReset(m.reset_time, plain)}`
+  );
+}
+
 function renderPretty(q, plain) {
   const b = plain ? '' : C.bold;
   const cy = plain ? '' : C.cyan;
@@ -90,22 +108,42 @@ function renderPretty(q, plain) {
   const acct = q.account || 'unknown';
   const plan = q.plan || q.current_tier || 'unknown';
   lines.push(`  ${cy}${acct}${rs}   plan: ${b}${plan}${rs}`);
-  lines.push('');
 
-  const nameW = Math.max(12, ...q.models.map((m) => m.model_id.length));
-  for (const m of q.models) {
-    const col = colorFor(m.remaining_fraction, plain);
-    const pct = `${m.remaining_percent.toFixed(1)}%`;
-    const pctStr = plain ? pct : `${col}${pct}${rs}`;
-    lines.push(
-      `  ${pad(m.model_id, nameW)}  ${bar(m.remaining_fraction, 20, plain)} ` +
-      `${pad(pctStr, plain ? 7 : 16)}  ${fmtReset(m.reset_time, plain)}`
-    );
+  // All-model pools, grouped by provider (fetchAvailableModels).
+  const providers = Array.isArray(q.providers) ? q.providers : [];
+  if (providers.length) {
+    const everyName = providers.flatMap((p) => p.models.map((m) => m.model_id));
+    const nameW = Math.max(12, ...everyName.map((n) => n.length));
+    for (const p of providers) {
+      const scope =
+        p.quota_scope === 'vertex_pool_shared'
+          ? 'shared Vertex pool — one meter for ALL Anthropic+OpenAI models'
+          : p.quota_scope === 'google_pool'
+          ? 'shared Google pool (token-weighted)'
+          : p.quota_scope;
+      lines.push('');
+      lines.push(`  ${b}${p.provider}${rs}  ${dim}${scope}${rs}`);
+      for (const m of p.models) lines.push(modelRow(m, nameW, plain, rs));
+    }
+  } else if (q.providers_error) {
+    lines.push('');
+    lines.push(`  ${dim}(all-model pool view unavailable: ${q.providers_error})${rs}`);
   }
+
+  // Authoritative Gemini REQUESTS buckets (retrieveUserQuota), kept verbatim.
+  if (q.models.length) {
+    const nameW = Math.max(12, ...q.models.map((m) => m.model_id.length));
+    lines.push('');
+    lines.push(`  ${b}GOOGLE · REQUESTS buckets${rs}  ${dim}retrieveUserQuota · authoritative per-account meter${rs}`);
+    for (const m of q.models) lines.push(modelRow(m, nameW, plain, rs));
+  }
+
   lines.push('');
-  const wcol = colorFor(q.remaining_fraction, plain);
-  const wpct = `${(q.remaining_fraction * 100).toFixed(1)}%`;
-  lines.push(`  worst remaining: ${plain ? wpct : wcol + b + wpct + rs}   reset: ${fmtReset(q.reset_time, plain)}`);
+  const wfrac = q.remaining_fraction_all_pools != null ? q.remaining_fraction_all_pools : q.remaining_fraction;
+  const wcol = colorFor(wfrac, plain);
+  const wpct = `${(wfrac * 100).toFixed(1)}%`;
+  lines.push(`  worst remaining (all pools): ${plain ? wpct : wcol + b + wpct + rs}`);
+  lines.push(`  ${dim}gemini-bucket worst: ${(q.remaining_fraction * 100).toFixed(1)}%  ·  reset ${fmtReset(q.reset_time, true)}${rs}`);
   lines.push('');
   return lines.join('\n');
 }
@@ -124,8 +162,11 @@ function renderPretty(q, plain) {
       process.stdout.write(renderPretty(q, opts.plain) + '\n');
     }
     if (opts.gate != null && !isNaN(opts.gate)) {
-      const ok = q.remaining_fraction * 100 >= opts.gate;
-      if (!ok) process.exit(10);
+      const frac =
+        opts.gateScope === 'all' && q.remaining_fraction_all_pools != null
+          ? q.remaining_fraction_all_pools
+          : q.remaining_fraction;
+      if (frac * 100 < opts.gate) process.exit(10);
     }
   } catch (e) {
     if (opts.json) {
