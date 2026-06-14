@@ -4,6 +4,8 @@
 
 直接從 Google 的 Code Assist 後端讀取你登入帳號的**真實**逐模型額度 —— 用的是 `agy` 本體自己呼叫的同一個端點 —— **不需要打開 Antigravity IDE、不需要 Windsurf/language-server 程序、也不需要任何本機 loopback API。** 輸出乾淨 JSON 給 agent/腳本用，或彩色表格給人看。
 
+同捆的 **[`agy-run`](#agy-run--用-antigravity-額度-headless-跑任務)** 更進一步：走同一條雲端路徑 headless **跑任務**（把 prompt 丟給 Antigravity 的生成端點），讓排程器用 Antigravity 的免費額度分擔工作。
+
 ```
   Antigravity quota  (windows-keyring)
   you@gmail.com   plan: Gemini Code Assist in Google One AI Ultra
@@ -81,11 +83,57 @@ agy-quota --gate 15 --json || echo "額度過低 —— 改派別處"
 # 最差剩餘 >= 15% 則 exit 0，否則 exit 10
 ```
 
+## `agy-run` —— 用 Antigravity 額度 headless 跑任務
+
+同一條雲端路徑不只能查額度，還能**直接跑任務**。`agy-run` 把一個 prompt 丟給 `agy` 本體實際呼叫的生成端點（`v1internal:generateContent`），純 HTTPS、無需 IDE / language-server / TTY，拿回模型回應文字與 token 用量。
+
+> 為什麼不用 `agy --print`？因為 `agy` CLI 是互動式 console 程式，在**無 TTY** 環境（自動化、排程器、CI）一律掛死、零輸出、也不扣額度。`agy-run` 直打 HTTP API 繞過這個限制。
+
+```
+agy-run [options] "你的 prompt"
+echo "你的 prompt" | agy-run [options]
+
+  -j, --json            輸出乾淨 JSON（回應文字 + token 用量）
+  -m, --model <id>      模型 id（預設 gemini-2.5-pro）
+  -s, --system <text>   system instruction
+  -t, --temperature <n> 取樣溫度
+      --max-tokens <n>  輸出 token 上限
+      --project <id>    覆寫 cloudaicompanionProject
+      --timeout <sec>   單次請求逾時秒數（預設 120）
+  -h, --help            顯示說明
+```
+
+**給 agent 調用的那一行：**
+
+```bash
+node bin/agy-run.js --json -m gemini-2.5-pro "你的任務 prompt" 
+# 或全域安裝後： agy-run --json -m gemini-2.5-pro "..."
+```
+
+JSON 輸出：
+
+```json
+{
+  "model": "gemini-2.5-pro",
+  "model_version": "gemini-2.5-pro",
+  "text": "模型的回應文字…",
+  "finish_reason": "STOP",
+  "usage": { "prompt_tokens": 12, "candidates_tokens": 7, "total_tokens": 146 },
+  "project": "reverberant-sprite-xxxxx",
+  "response_id": "…",
+  "source": "windows-keyring",
+  "fetched_at": "2026-06-14T11:30:43.391Z"
+}
+```
+
+可用模型：`gemini-2.5-pro`、`gemini-2.5-flash`、`gemini-2.5-flash-lite`、`gemini-3.1-flash-lite`（以 `agy-quota --json` 的 `models[]` 為準）。請求會消耗該帳號的**真實額度**——短期額度耗盡時端點會回 HTTP 429 `RESOURCE_EXHAUSTED`。
+
 ## 運作原理
 
 1. **憑證** —— Windows 上從認證管理員讀取 generic credential `gemini:antigravity`（UTF-8 JSON blob，走 `advapi32!CredRead`）。其他平台 fallback 到 `~/.gemini/oauth_creds.json`。
 2. **刷新** —— 拿 `refresh_token` 到 `oauth2.googleapis.com/token` 換新的 `access_token`。OAuth client id/secret 是**執行時從你本機安裝的 `agy` 二進位撈出來的**（不寫死在本 repo），所以原始碼裡不夾帶任何 Google secret。配對成功的組合會快取在 temp 目錄。（可用 `AGY_BIN=/path/to/agy` 指定二進位位置。）
 3. **額度** —— `POST https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` 回傳逐模型的 `remainingFraction` + `resetTime`；`loadCodeAssist` 補上層級/帳號。（`daily-cloudcode-pa.googleapis.com` 這個別名也通。）
+4. **跑任務（`agy-run`）** —— 同一個 host 的 `POST .../v1internal:generateContent`，payload 為 `{ model, project, request }`，其中 `project` 取自 `loadCodeAssist` 的 `cloudaicompanionProject`、`request` 是標準 Gemini `GenerateContentRequest`（`contents` / `systemInstruction` / `generationConfig`）。回應外層為 `{ response: {...} }`，文字在 `response.candidates[0].content.parts[].text`、用量在 `response.usageMetadata`。
 
 刷新後的 token 只在記憶體裡使用、**不會**寫回 keyring —— `agy` 自己會獨立維護它的 keyring token。
 
@@ -115,6 +163,11 @@ Reads your logged-in account's *real* per-model quota directly from Google's
 Code Assist backend — the same endpoint the `agy` binary itself calls — **without
 opening the Antigravity IDE, a Windsurf/language-server process, or any local
 loopback API.** Outputs clean JSON for agents/scripts or a colored table for humans.
+
+The bundled **[`agy-run`](#agy-run--run-tasks-headlessly-on-the-antigravity-quota)**
+goes one step further: it *runs tasks* headlessly over the same cloud path (sending
+a prompt to Antigravity's generative endpoint), letting a scheduler offload work
+onto the Antigravity free quota.
 
 ```
   Antigravity quota  (windows-keyring)
@@ -199,6 +252,60 @@ agy-quota --gate 15 --json || echo "low quota — route elsewhere"
 # exit 0 if worst remaining >= 15%, else exit 10
 ```
 
+## `agy-run` — run tasks headlessly on the Antigravity quota
+
+The same cloud path can do more than *check* quota — it can *run work*. `agy-run`
+sends a prompt to the very generative endpoint the `agy` binary itself calls
+(`v1internal:generateContent`) over plain HTTPS — no IDE, language-server, or TTY
+required — and returns the model's text plus token usage.
+
+> Why not `agy --print`? Because the `agy` CLI is an interactive console program
+> that **hangs with zero output (and consumes no quota) in any non-TTY
+> environment** (automation, schedulers, CI). `agy-run` calls the HTTP API
+> directly to sidestep that.
+
+```
+agy-run [options] "your prompt"
+echo "your prompt" | agy-run [options]
+
+  -j, --json            Emit clean JSON (response text + token usage)
+  -m, --model <id>      Model id (default gemini-2.5-pro)
+  -s, --system <text>   System instruction
+  -t, --temperature <n> Sampling temperature
+      --max-tokens <n>  Max output tokens
+      --project <id>    Override cloudaicompanionProject
+      --timeout <sec>   Per-request timeout in seconds (default 120)
+  -h, --help            Show help
+```
+
+**The one line an agent calls:**
+
+```bash
+node bin/agy-run.js --json -m gemini-2.5-pro "your task prompt"
+# or, after global install: agy-run --json -m gemini-2.5-pro "..."
+```
+
+JSON output:
+
+```json
+{
+  "model": "gemini-2.5-pro",
+  "model_version": "gemini-2.5-pro",
+  "text": "the model's reply…",
+  "finish_reason": "STOP",
+  "usage": { "prompt_tokens": 12, "candidates_tokens": 7, "total_tokens": 146 },
+  "project": "reverberant-sprite-xxxxx",
+  "response_id": "…",
+  "source": "windows-keyring",
+  "fetched_at": "2026-06-14T11:30:43.391Z"
+}
+```
+
+Available models: `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite`,
+`gemini-3.1-flash-lite` (see `models[]` from `agy-quota --json`). Requests consume
+the account's **real quota** — when short-term capacity is exhausted the endpoint
+returns HTTP 429 `RESOURCE_EXHAUSTED`.
+
 ## How it works
 
 1. **Credential** — on Windows, read the generic credential `gemini:antigravity`
@@ -212,6 +319,12 @@ agy-quota --gate 15 --json || echo "low quota — route elsewhere"
 3. **Quota** — `POST https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota`
    returns per-model `remainingFraction` + `resetTime`; `loadCodeAssist` adds the
    tier/account. (The `daily-cloudcode-pa.googleapis.com` alias works too.)
+4. **Run (`agy-run`)** — `POST .../v1internal:generateContent` on the same host,
+   with payload `{ model, project, request }` — `project` comes from
+   `loadCodeAssist`'s `cloudaicompanionProject`, and `request` is a standard Gemini
+   `GenerateContentRequest` (`contents` / `systemInstruction` / `generationConfig`).
+   The reply is wrapped as `{ response: {...} }`; text lives at
+   `response.candidates[0].content.parts[].text` and usage at `response.usageMetadata`.
 
 The refreshed token is used in-memory only and **not** written back — `agy`
 maintains its own keyring token independently.

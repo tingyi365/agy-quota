@@ -14,7 +14,7 @@ const { getClientCandidates, cacheWorkingClient } = require('./oauth-client');
 // Both hosts answer identically; daily- is the Antigravity-flavored alias.
 const DEFAULT_HOST = 'cloudcode-pa.googleapis.com';
 
-function postJson(url, headers, body) {
+function postJson(url, headers, body, timeoutMs = 12000) {
   return new Promise((resolve, reject) => {
     const data = body == null ? '' : body;
     const req = https.request(
@@ -22,7 +22,7 @@ function postJson(url, headers, body) {
       {
         method: 'POST',
         headers: { 'Content-Length': Buffer.byteLength(data), ...headers },
-        timeout: 12000,
+        timeout: timeoutMs,
       },
       (res) => {
         let buf = '';
@@ -92,14 +92,41 @@ function fetchUserQuota(accessToken, host = DEFAULT_HOST) {
   return callV1Internal(host, 'retrieveUserQuota', accessToken);
 }
 
-/** Tier + account context. */
+/** Tier + account context (incl. cloudaicompanionProject). */
 function loadCodeAssist(accessToken, host = DEFAULT_HOST) {
   return callV1Internal(host, 'loadCodeAssist', accessToken);
+}
+
+/**
+ * Run a generation request through the Antigravity generative endpoint
+ * (`v1internal:generateContent`) — the same RPC the agy binary calls.
+ *
+ * @param {string} accessToken
+ * @param {{model:string, project:string, request:object}} payload
+ *        request is a standard Gemini GenerateContentRequest
+ *        ({ contents, systemInstruction?, generationConfig?, ... }).
+ * @param {{host?:string, timeoutMs?:number}} [opts]
+ * @returns {Promise<object>} the raw Code Assist envelope ({ response, ... }).
+ */
+async function generateContent(accessToken, payload, opts = {}) {
+  const host = opts.host || DEFAULT_HOST;
+  const timeoutMs = opts.timeoutMs || 120000;
+  const r = await postJson(
+    `https://${host}/v1internal:generateContent`,
+    { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+    JSON.stringify(payload),
+    timeoutMs
+  );
+  if (r.status !== 200) {
+    throw new Error(`generateContent failed (HTTP ${r.status}): ${r.body.slice(0, 400)}`);
+  }
+  return JSON.parse(r.body);
 }
 
 module.exports = {
   refreshAccessToken,
   fetchUserQuota,
   loadCodeAssist,
+  generateContent,
   DEFAULT_HOST,
 };

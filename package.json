@@ -1,9 +1,10 @@
 {
   "name": "agy-quota",
   "version": "1.0.0",
-  "description": "Headless Antigravity (agy CLI) / Gemini Code Assist usage-quota checker — JSON for agents, colored output for humans. No IDE or language-server required.",
+  "description": "Headless Antigravity (agy CLI) / Gemini Code Assist quota checker + prompt runner — query usage and run prompts via the cloud API. JSON for agents, colored output for humans. No IDE, language-server, or TTY required.",
   "bin": {
-    "agy-quota": "bin/agy-quota.js"
+    "agy-quota": "bin/agy-quota.js",
+    "agy-run": "bin/agy-run.js"
   },
   "main": "src/quota.js",
   "scripts": {
