@@ -10,13 +10,16 @@
  *   agy-run "Summarize this in one line: ..."        human-readable output
  *   agy-run --json "..."                             clean JSON for agents
  *   agy-run -m gemini-2.5-flash "..."                pick a model
+ *   agy-run -m claude-opus-4-6-thinking "..."        Claude Opus 4.6
+ *   agy-run -m gpt-oss-120b-medium "..."             GPT-OSS 120B
  *   agy-run -s "You are terse." "..."                system instruction
+ *   agy-run --list-models                            list every callable model
  *   echo "long prompt..." | agy-run --json           read prompt from stdin
  *
  * Default model: gemini-2.5-pro. JSON is emitted on stdout; errors exit nonzero.
  */
 
-const { runPrompt, DEFAULT_MODEL } = require('../src/run');
+const { runPrompt, listModels, DEFAULT_MODEL } = require('../src/run');
 
 function readStdin() {
   return new Promise((resolve) => {
@@ -32,7 +35,7 @@ function readStdin() {
 
 function parseArgs(argv) {
   const o = {
-    json: false, help: false,
+    json: false, help: false, listModels: false,
     model: DEFAULT_MODEL, system: null, project: null,
     temperature: null, maxOutputTokens: null, timeoutMs: 120000,
     prompt: null,
@@ -42,6 +45,7 @@ function parseArgs(argv) {
     const a = argv[i];
     if (a === '--json' || a === '-j') o.json = true;
     else if (a === '--help' || a === '-h') o.help = true;
+    else if (a === '--list-models' || a === '-l') o.listModels = true;
     else if (a === '--model' || a === '-m') o.model = argv[++i];
     else if (a === '--system' || a === '-s') o.system = argv[++i];
     else if (a === '--project') o.project = argv[++i];
@@ -62,6 +66,7 @@ Usage:
 
 Options:
   -j, --json            Emit clean JSON (response text + token usage)
+  -l, --list-models     List every callable model (Gemini + Claude + GPT-OSS)
   -m, --model <id>      Model id (default ${DEFAULT_MODEL})
   -s, --system <text>   System instruction
   -t, --temperature <n> Sampling temperature
@@ -70,15 +75,51 @@ Options:
       --timeout <sec>   Per-request timeout in seconds (default 120)
   -h, --help            Show this help
 
-JSON fields: model, model_version, text, finish_reason,
+Models route automatically by id — same endpoint for every provider:
+  Gemini   gemini-2.5-pro · gemini-3-flash · gemini-3.1-pro-low · ...
+  Claude   claude-opus-4-6-thinking · claude-sonnet-4-6
+  GPT-OSS  gpt-oss-120b-medium
+Run "agy-run --list-models" for the live list + remaining quota.
+
+JSON fields: model, provider, model_version, text, finish_reason,
              usage{prompt_tokens,candidates_tokens,total_tokens},
              project, response_id, source, fetched_at
 Exit codes:  0 ok  ·  1 error`;
+
+function renderModels(list) {
+  const rows = list.models;
+  const idW = Math.max(8, ...rows.map((m) => m.model_id.length));
+  const out = [''];
+  let lastProv = null;
+  for (const m of rows) {
+    if (m.provider !== lastProv) {
+      out.push(`  ${m.provider.toUpperCase()}`);
+      lastProv = m.provider;
+    }
+    const q = m.remaining_percent == null ? '   —' : `${m.remaining_percent.toFixed(0)}%`.padStart(4);
+    const flags = [m.supports_thinking ? 'think' : '', m.recommended ? 'rec' : ''].filter(Boolean).join(',');
+    out.push(`    ${m.model_id.padEnd(idW)}  q=${q}  ${(m.display_name || '').padEnd(28)} ${flags}`);
+  }
+  out.push('');
+  return out.join('\n');
+}
 
 (async () => {
   const opts = parseArgs(process.argv.slice(2));
   if (opts.help) {
     process.stdout.write(HELP + '\n');
+    return;
+  }
+  if (opts.listModels) {
+    try {
+      const list = await listModels({ project: opts.project });
+      if (opts.json) process.stdout.write(JSON.stringify(list, null, 2) + '\n');
+      else process.stdout.write(renderModels(list) + '\n');
+    } catch (e) {
+      if (opts.json) process.stdout.write(JSON.stringify({ error: e.message }, null, 2) + '\n');
+      else process.stderr.write(`agy-run error: ${e.message}\n`);
+      process.exit(1);
+    }
     return;
   }
   if (!opts.prompt) {

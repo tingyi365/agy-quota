@@ -14,6 +14,21 @@ const { getClientCandidates, cacheWorkingClient } = require('./oauth-client');
 // Both hosts answer identically; daily- is the Antigravity-flavored alias.
 const DEFAULT_HOST = 'cloudcode-pa.googleapis.com';
 
+/**
+ * Headers that identify the caller as the Antigravity IDE. These are REQUIRED
+ * to reach the non-Google providers (Anthropic Claude, OpenAI GPT-OSS): without
+ * the `Client-Metadata: {"ideType":"ANTIGRAVITY"}` marker the backend answers
+ * 404 NOT_FOUND for those models (Gemini works either way). Sending them is
+ * harmless for Gemini, so we attach them to every generative call.
+ */
+const ANTIGRAVITY_HEADERS = {
+  'User-Agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) ' +
+    'Antigravity/1.0.0 Chrome/138.0.7204.235 Electron/37.3.1 Safari/537.36',
+  'X-Goog-Api-Client': 'google-cloud-sdk vscode_cloudshelleditor/0.1',
+  'Client-Metadata': '{"ideType":"ANTIGRAVITY","platform":"WINDOWS","pluginType":"GEMINI"}',
+};
+
 function postJson(url, headers, body, timeoutMs = 12000) {
   return new Promise((resolve, reject) => {
     const data = body == null ? '' : body;
@@ -113,7 +128,11 @@ async function generateContent(accessToken, payload, opts = {}) {
   const timeoutMs = opts.timeoutMs || 120000;
   const r = await postJson(
     `https://${host}/v1internal:generateContent`,
-    { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+    {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+      ...ANTIGRAVITY_HEADERS,
+    },
     JSON.stringify(payload),
     timeoutMs
   );
@@ -123,10 +142,41 @@ async function generateContent(accessToken, payload, opts = {}) {
   return JSON.parse(r.body);
 }
 
+/**
+ * List every model the account can call (Gemini + Claude + GPT-OSS), with per
+ * model quota. This is the authoritative source of valid model ids — the keys
+ * of the returned `models` map are exactly what `generateContent` expects.
+ *
+ * @param {string} accessToken
+ * @param {{host?:string, project?:string, timeoutMs?:number}} [opts]
+ * @returns {Promise<object>} raw envelope: { models: { <id>: {…}, … } }
+ */
+async function fetchAvailableModels(accessToken, opts = {}) {
+  const host = opts.host || DEFAULT_HOST;
+  const timeoutMs = opts.timeoutMs || 30000;
+  const body = opts.project ? JSON.stringify({ project: opts.project }) : '{}';
+  const r = await postJson(
+    `https://${host}/v1internal:fetchAvailableModels`,
+    {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+      ...ANTIGRAVITY_HEADERS,
+    },
+    body,
+    timeoutMs
+  );
+  if (r.status !== 200) {
+    throw new Error(`fetchAvailableModels failed (HTTP ${r.status}): ${r.body.slice(0, 200)}`);
+  }
+  return JSON.parse(r.body);
+}
+
 module.exports = {
   refreshAccessToken,
   fetchUserQuota,
   loadCodeAssist,
   generateContent,
+  fetchAvailableModels,
+  ANTIGRAVITY_HEADERS,
   DEFAULT_HOST,
 };
