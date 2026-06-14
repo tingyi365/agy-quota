@@ -1,0 +1,32 @@
+{
+  "name": "agy-quota",
+  "version": "1.0.0",
+  "description": "Headless Antigravity (agy CLI) / Gemini Code Assist usage-quota checker — JSON for agents, colored output for humans. No IDE or language-server required.",
+  "bin": {
+    "agy-quota": "bin/agy-quota.js"
+  },
+  "main": "src/quota.js",
+  "scripts": {
+    "start": "node bin/agy-quota.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "antigravity",
+    "agy",
+    "gemini",
+    "code-assist",
+    "quota",
+    "usage",
+    "cli",
+    "headless"
+  ],
+  "license": "MIT",
+  "files": [
+    "bin/",
+    "src/",
+    "README.md",
+    "LICENSE"
+  ]
+}
