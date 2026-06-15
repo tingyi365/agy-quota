@@ -24,7 +24,8 @@ The one unproven assumption was whether Antigravity, when proxying Claude,
 accepts Gemini-format tool declarations and returns tool calls. It does. Proven
 end-to-end with a real `claude` CLI run that issued a `Read` tool call (a full
 Read→Glob→Read→answer agent loop), routed entirely through this proxy onto the
-free Opus quota. See `M1-RESULTS.md` for the iron-clad evidence.
+free Opus quota. The two GO/NO-GO probes (`probe-toolcall.js`,
+`probe-roundtrip.js`) reproduce the tool-call round-trip in both directions.
 
 Key translation facts discovered:
 - Claude tool use ⇄ Gemini `functionCall` / `functionResponse` round-trips both ways.
@@ -39,13 +40,31 @@ Key translation facts discovered:
 ## Run it (resident)
 
 ```
-# from the repo root
+# self-healing resident launcher (fixed port, restart-on-crash, /health probe, log)
+powershell -NoProfile -ExecutionPolicy Bypass -File proxy\start-proxy.ps1
+
+# or bare, for a quick foreground run
 node proxy/server.js
-# or
-npm run proxy
 ```
 
+The launcher self-checks the agy keyring token at boot, logs to
+`proxy/agy-proxy.log`, and restarts the server with capped backoff if it dies.
 Then in another shell, drive any Anthropic client through it.
+
+### Production hardening (M2)
+
+- **Startup auth self-check** — refreshes the keyring token + resolves the
+  project at boot; logs loudly if the agy login is stale (does not crash, so
+  `/health` stays reportable).
+- **No silent failures** — upstream errors are classified and surfaced with a
+  distinct log tag + HTTP status: `QUOTA-EXHAUSTED` (429), `SCHEMA-REJECTED`
+  (400), `AUTH-FAILED` / `UPSTREAM-ERROR` (502). Every `/v1/messages` logs one
+  line (`OK … -> <stop_reason> in/out tokens`).
+- **stop_reason** — `STOP→end_turn`, `MAX_TOKENS→max_tokens`,
+  `OTHER`+functionCall`→tool_use`; tool presence always wins.
+- **Pure unit tests** — `node proxy/test-translate.js` covers the sanitizer
+  (union collapse + keyword whitelist), stop_reason map, tool round-trip,
+  multi-tool concurrency and error classification (no network).
 
 ### Configuration (env vars)
 

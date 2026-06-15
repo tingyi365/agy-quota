@@ -392,13 +392,48 @@ function streamAnthropic(res, message) {
   res.end();
 }
 
+/**
+ * Map an upstream failure (auth refresh OR generateContent) to an
+ * Anthropic-shaped error with the right HTTP status and a short log tag.
+ * We NEVER swallow: quota exhaustion, schema rejection and auth failures each
+ * get a distinct, loud line so a worker that fell over is diagnosable from the
+ * proxy log alone.
+ */
+function classifyUpstreamError(e) {
+  const msg = e && e.message ? e.message : String(e);
+  const m = /HTTP (\d{3})/.exec(msg);
+  const status = m ? parseInt(m[1], 10) : 0;
+  if (status === 429 || /RESOURCE_EXHAUSTED|exhaust|\bquota\b|rate.?limit/i.test(msg)) {
+    return { tag: 'QUOTA-EXHAUSTED', http: 429, type: 'rate_limit_error',
+      message: 'Antigravity Vertex pool exhausted / rate-limited — fall back to the paid Anthropic API. Upstream: ' + msg };
+  }
+  if (/JSON schema is invalid|INVALID_ARGUMENT|input_schema|functionDeclarations/i.test(msg)) {
+    return { tag: 'SCHEMA-REJECTED', http: 400, type: 'invalid_request_error',
+      message: 'Antigravity rejected the request schema (a tool input_schema likely survived sanitization unconverted). Upstream: ' + msg };
+  }
+  if (status === 401 || status === 403 || /UNAUTHENTICATED|PERMISSION_DENIED|refresh failed|cloudaicompanionProject/i.test(msg)) {
+    return { tag: 'AUTH-FAILED', http: 502, type: 'authentication_error',
+      message: 'Antigravity auth failed (token refresh or project resolution). Re-run an interactive agy login. Upstream: ' + msg };
+  }
+  return { tag: 'UPSTREAM-ERROR', http: 502, type: 'api_error', message: msg };
+}
+
 async function handleMessages(req, res, body) {
   const wantStream = !!body.stream;
-  const auth = await getAuth();
+  const toolCount = Array.isArray(body.tools) ? body.tools.length : 0;
+
+  let auth, env;
+  try {
+    auth = await getAuth();
+  } catch (e) {
+    const c = classifyUpstreamError(e);
+    log(`${c.tag} /v1/messages (auth) tools=${toolCount} stream=${wantStream}: ${c.message}`);
+    return sendJson(res, c.http, { type: 'error', error: { type: c.type, message: c.message } });
+  }
+
   const request = anthropicToGemini(body);
   dbg('gemini-request', { model: UPSTREAM_MODEL, request });
 
-  let env;
   try {
     env = await generateContent(
       auth.accessToken,
@@ -406,12 +441,14 @@ async function handleMessages(req, res, body) {
       { timeoutMs: 180000 }
     );
   } catch (e) {
-    log('upstream error:', e.message);
-    return sendJson(res, 502, { type: 'error', error: { type: 'api_error', message: e.message } });
+    const c = classifyUpstreamError(e);
+    log(`${c.tag} /v1/messages tools=${toolCount} stream=${wantStream}: ${c.message}`);
+    return sendJson(res, c.http, { type: 'error', error: { type: c.type, message: c.message } });
   }
   dbg('gemini-response', env);
 
   const { content, stop_reason } = geminiToAnthropicContent(env);
+  const usage = usageFromEnv(env);
   const message = {
     id: env?.response?.responseId || genId('msg'),
     type: 'message',
@@ -420,9 +457,10 @@ async function handleMessages(req, res, body) {
     content,
     stop_reason,
     stop_sequence: null,
-    usage: usageFromEnv(env),
+    usage,
   };
 
+  log(`OK /v1/messages tools=${toolCount} stream=${wantStream} -> ${stop_reason} in=${usage.input_tokens} out=${usage.output_tokens}`);
   if (wantStream) return streamAnthropic(res, message);
   return sendJson(res, 200, message);
 }
@@ -444,7 +482,16 @@ const server = http.createServer(async (req, res) => {
   const url = (req.url || '').split('?')[0];
 
   if (req.method === 'GET' && url === '/health') {
-    return sendJson(res, 200, { ok: true, upstream_model: UPSTREAM_MODEL });
+    // Cheap liveness + cached-auth readiness. `auth_ready` reflects whether we
+    // currently hold a non-expired access token + resolved project (it does NOT
+    // make a network call — the launcher's deeper check uses agy-quota).
+    const authReady = !!(_tok.accessToken && Date.now() < _tok.expMs - 60000 && _tok.project);
+    return sendJson(res, 200, {
+      ok: true,
+      upstream_model: UPSTREAM_MODEL,
+      auth_ready: authReady,
+      project: _tok.project || null,
+    });
   }
 
   if (req.method !== 'POST') {
@@ -472,7 +519,34 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, HOST, () => {
-  log(`listening on http://${HOST}:${PORT}  ->  Antigravity model "${UPSTREAM_MODEL}"`);
-  log(`point a client at it with:  ANTHROPIC_BASE_URL=http://${HOST}:${PORT}`);
-});
+// Only bind the port when run as a script. Requiring this file (e.g. from a
+// unit test) exposes the pure translation/classification helpers without the
+// listen side-effect.
+if (require.main === module) {
+  server.listen(PORT, HOST, () => {
+    log(`listening on http://${HOST}:${PORT}  ->  Antigravity model "${UPSTREAM_MODEL}"`);
+    log(`point a client at it with:  ANTHROPIC_BASE_URL=http://${HOST}:${PORT}`);
+
+    // Startup self-check: prove the agy keyring credential refreshes and the
+    // project resolves BEFORE any worker depends on us. We do not exit on
+    // failure (a later agy re-login can recover, and /health must stay up so the
+    // launcher can report) — but we log loudly so the boot failure is visible.
+    getAuth()
+      .then((a) => log(`auth self-check OK — project=${a.project}, token cached for ~${Math.round((a.expMs - Date.now()) / 60000)}min`))
+      .catch((e) => log(`AUTH-SELFCHECK-FAILED at boot: ${e.message} — proxy is up but /v1/messages will 502 until an agy login is refreshed`));
+  });
+
+  // Don't let a stray upstream/socket error take the whole resident proxy down;
+  // the launcher's restart loop is the backstop, but in-process we stay alive.
+  process.on('uncaughtException', (e) => log(`uncaughtException: ${e && e.stack ? e.stack : e}`));
+  process.on('unhandledRejection', (e) => log(`unhandledRejection: ${e && e.message ? e.message : e}`));
+}
+
+module.exports = {
+  anthropicToGemini,
+  geminiToAnthropicContent,
+  sanitizeSchema,
+  collapseUnion,
+  mapStopReason,
+  classifyUpstreamError,
+};
