@@ -10,6 +10,7 @@
 
 const https = require('https');
 const { getClientCandidates, cacheWorkingClient } = require('./oauth-client');
+const { saveRefreshToken } = require('./credentials');
 
 // Both hosts answer identically; daily- is the Antigravity-flavored alias.
 const DEFAULT_HOST = 'cloudcode-pa.googleapis.com';
@@ -82,7 +83,15 @@ async function refreshAccessToken(refreshToken) {
       const j = JSON.parse(r.body);
       if (j.access_token) {
         cacheWorkingClient(clientId, clientSecret);
-        return { accessToken: j.access_token, expiresIn: j.expires_in };
+        // H3: handle refresh_token rotation. If upstream returned a new one,
+        // persist it (best-effort) so the old token going stale doesn't force a
+        // manual `agy login`. Returns the effective refresh_token for callers.
+        let effectiveRefresh = refreshToken;
+        if (j.refresh_token && j.refresh_token !== refreshToken) {
+          try { saveRefreshToken(j.refresh_token); } catch (_) {}
+          effectiveRefresh = j.refresh_token;
+        }
+        return { accessToken: j.access_token, expiresIn: j.expires_in, refreshToken: effectiveRefresh };
       }
     }
     lastErr = `HTTP ${r.status}: ${r.body.slice(0, 120)}`;

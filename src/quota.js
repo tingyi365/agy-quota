@@ -7,7 +7,19 @@
 
 const { loadCredential } = require('./credentials');
 const { refreshAccessToken, fetchUserQuota, loadCodeAssist, fetchAvailableModels } = require('./api');
-const { providerForModel } = require('./run');
+
+/**
+ * Best-effort provider label from a model id. Kept inline (rather than imported)
+ * so the quota path is fully self-contained — classification is a pure string
+ * map and has no other dependency on the task-runner code.
+ */
+function providerForModel(id) {
+  const s = String(id || '').toLowerCase();
+  if (s.startsWith('claude') || s.includes('anthropic')) return 'anthropic';
+  if (s.startsWith('gpt') || s.includes('oss') || /^o[1-9]/.test(s) || s.includes('openai')) return 'openai';
+  if (s.startsWith('gemini') || s.startsWith('tab')) return 'google';
+  return 'unknown';
+}
 
 /**
  * Group the fetchAvailableModels response into provider buckets.

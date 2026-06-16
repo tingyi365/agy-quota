@@ -1,10 +1,9 @@
 {
   "name": "agy-quota",
-  "version": "1.0.0",
-  "description": "Headless Antigravity (agy CLI) / Gemini Code Assist quota checker + multi-model prompt runner — query usage and run prompts on Gemini, Claude (Opus/Sonnet 4.6) and GPT-OSS via the cloud API. JSON for agents, colored output for humans. No IDE, language-server, or TTY required.",
+  "version": "2.0.0",
+  "description": "Headless Antigravity (agy CLI) / Gemini Code Assist quota checker — query your account's real remaining usage across every callable model (Gemini, Claude, GPT-OSS), grouped by provider, straight from the cloud API. Clean JSON for agents, colored table for humans, --gate mode for schedulers. No IDE, language-server, or TTY required.",
   "bin": {
-    "agy-quota": "bin/agy-quota.js",
-    "agy-run": "bin/agy-run.js"
+    "agy-quota": "bin/agy-quota.js"
   },
   "main": "src/quota.js",
   "scripts": {

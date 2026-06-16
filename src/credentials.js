@@ -97,6 +97,106 @@ if ($b -eq $null) { [Console]::Error.WriteLine('CRED_NOT_FOUND'); exit 3 }
   return blob;
 }
 
+/**
+ * Persist a blob back into the Windows Credential Manager via CredWriteW.
+ * Reads the existing credential first to preserve its UserName / Persist / Type
+ * exactly (go-keyring is sensitive to these); only the blob bytes are replaced.
+ * Throws on failure — callers treat write-back as best-effort and swallow.
+ */
+function writeWindowsKeyring(blob) {
+  const jsonText = JSON.stringify(blob);
+  const b64 = Buffer.from(jsonText, 'utf8').toString('base64');
+  const ps = `
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$WarningPreference = 'SilentlyContinue'
+$sig = @'
+using System;
+using System.Runtime.InteropServices;
+public class CredWriter {
+  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+  public static extern bool CredRead(string target, int type, int flags, out IntPtr credential);
+  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode, EntryPoint="CredWriteW")]
+  public static extern bool CredWrite(ref CREDENTIAL userCredential, int flags);
+  [DllImport("advapi32.dll", SetLastError=false)]
+  public static extern void CredFree(IntPtr cred);
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+  public struct CREDENTIAL {
+    public int Flags; public int Type; public IntPtr TargetName; public IntPtr Comment;
+    public long LastWritten; public int CredentialBlobSize; public IntPtr CredentialBlob;
+    public int Persist; public int AttributeCount; public IntPtr Attributes;
+    public IntPtr TargetAlias; public IntPtr UserName;
+  }
+  public static int Write(string target, byte[] blob) {
+    int persist = 2; int type = 1; string userName = null;
+    IntPtr p;
+    if (CredRead(target, 1, 0, out p)) {
+      try {
+        var ex = (CREDENTIAL)Marshal.PtrToStructure(p, typeof(CREDENTIAL));
+        persist = ex.Persist; type = ex.Type;
+        if (ex.UserName != IntPtr.Zero) userName = Marshal.PtrToStringUni(ex.UserName);
+      } finally { CredFree(p); }
+    }
+    IntPtr blobPtr = Marshal.AllocHGlobal(blob.Length);
+    Marshal.Copy(blob, 0, blobPtr, blob.Length);
+    IntPtr targetPtr = Marshal.StringToCoTaskMemUni(target);
+    IntPtr userPtr = userName != null ? Marshal.StringToCoTaskMemUni(userName) : IntPtr.Zero;
+    var c = new CREDENTIAL();
+    c.Type = type; c.TargetName = targetPtr;
+    c.CredentialBlobSize = blob.Length; c.CredentialBlob = blobPtr;
+    c.Persist = persist; c.UserName = userPtr;
+    bool ok = CredWrite(ref c, 0);
+    int err = ok ? 0 : Marshal.GetLastWin32Error();
+    Marshal.FreeHGlobal(blobPtr);
+    Marshal.FreeCoTaskMem(targetPtr);
+    if (userPtr != IntPtr.Zero) Marshal.FreeCoTaskMem(userPtr);
+    return err;
+  }
+}
+'@
+Add-Type -TypeDefinition $sig | Out-Null
+$blob = [System.Convert]::FromBase64String('${b64}')
+$err = [CredWriter]::Write('${KEYRING_TARGET}', $blob)
+if ($err -ne 0) { [Console]::Error.WriteLine('CRED_WRITE_FAILED:' + $err); exit 4 }
+[Console]::Out.Write('OK')
+`.trim();
+
+  const encoded = Buffer.from(ps, 'utf16le').toString('base64');
+  execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], {
+    encoding: 'utf8', windowsHide: true, maxBuffer: 1024 * 1024,
+  });
+}
+
+/**
+ * Best-effort write-back of a rotated refresh_token. agy/Google may rotate the
+ * refresh_token on each refresh; if we keep using the old one it eventually 401s
+ * permanently (forcing a manual `agy login`). We read the current blob, swap ONLY
+ * token.refresh_token, and persist — preserving every other field/format.
+ * Returns true on success; never throws (the caller already has a valid access token).
+ */
+function saveRefreshToken(newRefreshToken) {
+  if (!newRefreshToken) return false;
+  try {
+    if (process.platform === 'win32') {
+      const blob = readWindowsKeyring();
+      const tok = blob.token || blob;
+      if (tok.refresh_token === newRefreshToken) return false; // unchanged → no write
+      tok.refresh_token = newRefreshToken;
+      writeWindowsKeyring(blob);
+      return true;
+    }
+    const p = path.join(os.homedir(), '.gemini', 'oauth_creds.json');
+    if (!fs.existsSync(p)) return false;
+    const j = JSON.parse(fs.readFileSync(p, 'utf8'));
+    if (j.refresh_token === newRefreshToken) return false;
+    j.refresh_token = newRefreshToken;
+    fs.writeFileSync(p, JSON.stringify(j), { encoding: 'utf8', mode: 0o600 });
+    return true;
+  } catch (_) {
+    return false; // best-effort; refresh still succeeded with the new access token
+  }
+}
+
 /** Fallback for non-Windows: the old gemini-cli oauth_creds.json. */
 function readFileCreds() {
   const p = path.join(os.homedir(), '.gemini', 'oauth_creds.json');
@@ -144,4 +244,4 @@ function loadCredential() {
   };
 }
 
-module.exports = { loadCredential, KEYRING_TARGET };
+module.exports = { loadCredential, saveRefreshToken, KEYRING_TARGET };
